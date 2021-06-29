@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -17,7 +18,8 @@ import (
 )
 
 type App struct {
-	DB *sql.DB
+	DB            *sql.DB
+	transactiondb *sql.DB
 }
 
 func hashAndSalt(pwd []byte) string {
@@ -34,10 +36,13 @@ var a = &App{}
 var mySigningKey = []byte("scott")
 
 type User struct {
-	Username string `json:"username"`
-	Rollno   int    `json:"rollno"`
-	Name     string `json:"name"`
-	Password string `json:"password"`
+	Username                 string `json:"username"`
+	Rollno                   int    `json:"rollno"`
+	Name                     string `json:"name"`
+	Password                 string `json:"password"`
+	Coins                    int    `json:"coins"`
+	PermissionsLevel         int    `json:"permissions"`
+	CompetitionsParticipated int    `json:"competitionsParticipated"`
 }
 
 type userlogin struct {
@@ -105,18 +110,27 @@ func signup(rw http.ResponseWriter, req *http.Request) {
 	var user User
 	json.Unmarshal([]byte(string(body)), &user)
 	//fmt.Println(user.Username)
+	user.Coins = 0
+	user.PermissionsLevel = 0
+	user.CompetitionsParticipated = 0
+	if user.Rollno == 999999 {
+		user.PermissionsLevel = 2
+	}
 	passkey := hashAndSalt([]byte(user.Password))
 	//fmt.Println(passkey)
 	data, _ := a.DB.Begin()
 	//fmt.Println(data)
-	statement, _ := data.Prepare("INSERT INTO user (username, rollno, name, password, coins) VALUES (?, ?, ?, ?, ?) ")
-	//fmt.Println(statement)
-	_, error := statement.Exec(user.Username, user.Rollno, user.Name, passkey, 0)
+	statement, _ := data.Prepare("INSERT INTO user (username, name, rollno, password, coins, permissionLevel, competitionsParticipated) VALUES (?, ?, ?, ?, ?, ?, ?)")
+	demo, err := statement.Exec(user.Username, user.Name, user.Rollno, passkey, user.Coins, user.PermissionsLevel, user.CompetitionsParticipated)
+
+	fmt.Println(demo)
+
 	if err != nil {
-		fmt.Println(error)
+		fmt.Println(err)
 	}
 
 	data.Commit()
+	fmt.Println("USER CREATED HURRAY!!!")
 
 }
 
@@ -195,6 +209,58 @@ func isAuthorized(endpoint func(http.ResponseWriter, *http.Request)) http.Handle
 	})
 }
 
+func ExtractClaims(tokenStr string) (jwt.MapClaims, bool) {
+	// hmacSecretString := // Value
+	hmacSecret := mySigningKey
+	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		// check token signing method etc
+		return hmacSecret, nil
+	})
+
+	if err != nil {
+		return nil, false
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		return claims, true
+	} else {
+		log.Printf("Invalid JWT Token")
+		return nil, false
+	}
+}
+
+func GetUserPermission(db *sql.DB, rollno int) int {
+	query := db.QueryRow("select permissionLevel from user where rollno=$1", rollno)
+	var id int
+	query.Scan(&id)
+
+	return id
+}
+
+func GetNumCompetiton(db *sql.DB, rollno int) int {
+	query := db.QueryRow("select competitionsParticipated from user where rollno=$1", rollno)
+	var id int
+	query.Scan(&id)
+
+	return id
+}
+
+func UpdateNumCompetitions(db *sql.DB, id int, rollno int, competitions int) bool {
+	sid := strconv.Itoa(id)
+	scompetitions := strconv.Itoa(competitions)
+	// srollno := strconv.Itoa(rollno)
+	tx, _ := db.Begin()
+	stmt, _ := tx.Prepare("update user set competitionsParticipated=? where id=?")
+	_, err := stmt.Exec(scompetitions, sid)
+	if err != nil {
+		fmt.Println(err)
+		return false
+	}
+	tx.Commit()
+
+	return true
+}
+
 func getbal(w http.ResponseWriter, r *http.Request) {
 	lock.Lock()
 	defer lock.Unlock()
@@ -211,8 +277,39 @@ func getbal(w http.ResponseWriter, r *http.Request) {
 
 	var user UpdateCoins
 	json.Unmarshal([]byte(string(body)), &user)
+	claims, status1 := ExtractClaims(r.Header["Token"][0])
+	if status1 {
+		permission := GetUserPermission(a.DB, int(claims["rollno"].(float64)))
 
-	currentCoins := GetCoins(a.DB, user.Rollno)
+		if permission == 2 {
+			userId := GetUserId(a.DB, user.Rollno)
+
+			if userId == 0 {
+				fmt.Println("No such user present!")
+				return
+			}
+
+			currentCoins := GetCoins(a.DB, user.Rollno)
+			numCompetiton := GetNumCompetiton(a.DB, user.Rollno)
+
+			status := UpdateUser(a.DB, userId, user.Rollno, user.Coins+currentCoins)
+			numCompetiton = numCompetiton + 1
+			status2 := UpdateNumCompetitions(a.DB, userId, user.Rollno, numCompetiton)
+			status3 := AddTransaction(a.transactiondb, "add", user.Rollno, int(claims["rollno"].(float64)), user.Coins, time.Now().String())
+
+			if status && status2 && status3 {
+				fmt.Println("Coins given Successfully!")
+			} else {
+				fmt.Println("Error in giving coins, please try again!")
+			}
+		} else {
+			fmt.Println("You are not authorized to give Coins!")
+		}
+	} else {
+		fmt.Println("Please re-login and try again!")
+	}
+
+	/*currentCoins := GetCoins(a.DB, user.Rollno)
 	userId := GetUserId(a.DB, user.Rollno)
 
 	if userId == 0 {
@@ -232,6 +329,19 @@ func getbal(w http.ResponseWriter, r *http.Request) {
 	/*else {
 	    fmt.Println("Error in giving coins, please try again!")
 	}*/
+}
+
+func AddTransaction(db *sql.DB, typeOfTransaction string, transferToRollno int, senderRollNo int, coins int, timestamp string) bool {
+	tx, _ := db.Begin()
+	stmt, _ := tx.Prepare("INSERT INTO transactionHistory (typeOfTransaction, transferToRollno, senderRollNo, coins, timestamp) VALUES (?, ?, ?, ?, ?)")
+	_, err := stmt.Exec(typeOfTransaction, transferToRollno, senderRollNo, coins, timestamp)
+	if err != nil {
+		fmt.Println(err)
+		return false
+	}
+	tx.Commit()
+
+	return true
 }
 
 func transfer(w http.ResponseWriter, r *http.Request) {
@@ -268,14 +378,32 @@ func transfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	numCompetiton := GetNumCompetiton(a.DB, user.ReceiverRollno)
+	if numCompetiton == 0 {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Println("Ineligible User")
+
+		return
+	}
+
 	senderCoins := GetCoins(a.DB, user.SenderRollno)
 	receiverCoins := GetCoins(a.DB, user.ReceiverRollno)
 
 	if senderCoins >= user.Coins {
+		var coins float64 = float64(user.Coins)
+		diff := user.SenderRollno/10000 - user.ReceiverRollno/10000
+
+		if math.Abs(float64(diff)) > 0 {
+			coins = (coins * 2) / 3
+		} else if math.Abs(float64(diff)) == 0 {
+			coins = (coins * 49) / 50
+		}
+
 		status1 := UpdateUser(a.DB, senderUser, user.SenderRollno, senderCoins-user.Coins)
-		status2 := UpdateUser(a.DB, receiverUser, user.ReceiverRollno, receiverCoins+user.Coins)
+		status2 := UpdateUser(a.DB, receiverUser, user.ReceiverRollno, receiverCoins+int(coins))
 
 		if status1 && status2 {
+			AddTransaction(a.transactiondb, "transfer", user.ReceiverRollno, user.SenderRollno, user.Coins, time.Now().String())
 			fmt.Println("Transfer successful!!!")
 
 			return
@@ -374,8 +502,12 @@ func GetUserId(db *sql.DB, rollno int) int {
 func main() {
 	database, _ := sql.Open("sqlite3", "./userdata.db")
 	a.DB = database
-	statement, _ := database.Prepare("CREATE TABLE IF NOT EXISTS user (id INTEGER PRIMARY KEY,username TEXT, rollno INTEGER, name TEXT, password TEXT, coins INTEGER)")
+	statement, _ := database.Prepare("CREATE TABLE IF NOT EXISTS user (id INTEGER PRIMARY KEY,username TEXT, name TEXT, rollno INTEGER, password TEXT, coins INTEGER, permissionLevel INTEGER, competitionsParticipated INTEGER)")
 	statement.Exec()
+	db, _ := sql.Open("sqlite3", "./transactionHistory.db")
+	a.transactiondb = db
+	statement1, _ := db.Prepare("CREATE TABLE IF NOT EXISTS transactionHistory (id INTEGER PRIMARY KEY, typeOfTransaction TEXT, transferToRollno INTEGER, senderRollNo INTEGER, coins INTEGER, timestamp TEXT)")
+	statement1.Exec()
 
 	/*rows, _ := database.Query("SELECT id, rollno, name FROM user")
 	var id int
@@ -403,9 +535,9 @@ func main() {
 	http.HandleFunc("/login", login)
 	http.Handle("/secretpage", isAuthorized(homePage))
 	http.HandleFunc("/signup", signup)
-	http.HandleFunc("/initialise", getbal)
-	http.HandleFunc("/transfer", transfer)
-	http.HandleFunc("/balance", balance)
+	http.Handle("/initialise", isAuthorized(getbal))
+	http.Handle("/transfer", isAuthorized(transfer))
+	http.Handle("/balance", isAuthorized(balance))
 
 	fmt.Printf("Starting server at port 8080\n")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
