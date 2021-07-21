@@ -60,6 +60,17 @@ type UpdateCoins struct {
 	Coins  int `json:"coins"`
 }
 
+type RedeemReqCust struct {
+	Id       int    `json:"id"`
+	Rollno   int    `json:"rollno"`
+	Coins    int    `json:"coins"`
+	ItemName string `json:"itemname"`
+}
+
+type AcceptReq struct {
+	Id int `json:"id"`
+}
+
 type TransferCoins struct {
 	SenderRollno   int `json:"senderRollno"`
 	ReceiverRollno int `json:"receiverRollno"`
@@ -499,6 +510,235 @@ func GetUserId(db *sql.DB, rollno int) int {
 	return id
 }
 
+func unapprovedrequest(w http.ResponseWriter, r *http.Request) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	time.Sleep(1 * time.Second)
+
+	r.ParseForm()
+	w.Header().Set("Content-Type", "application/json")
+
+	claims, status1 := ExtractClaims(r.Header["Token"][0])
+
+	if status1 {
+		permission := GetUserPermission(a.DB, int(claims["rollno"].(float64)))
+
+		if permission == 2 {
+			rows2, _ := a.DB.Query("SELECT id, rollno, coins, itemName, status FROM redeem")
+
+			var id2 int
+			var rollno1 string
+			var coins1 string
+			var status string
+			var itemName string
+
+			for rows2.Next() {
+				rows2.Scan(&id2, &rollno1, &coins1, &itemName, &status)
+				if status == "1" {
+					fmt.Println(strconv.Itoa(id2) + ": " + rollno1 + " " + coins1 + " " + itemName + " " + status)
+				}
+			}
+		} else {
+			fmt.Println("You are not authorized to see pending requests!")
+			return
+		}
+	} else {
+		fmt.Println("Please re-login and try again!")
+		return
+	}
+}
+
+func IsJSON(s string) bool {
+	var js map[string]interface{}
+	return json.Unmarshal([]byte(s), &js) == nil
+}
+
+func AddRedeemRequest(db *sql.DB, name string, rollno int, coins int) bool {
+	tx, _ := db.Begin()
+	stmt, _ := tx.Prepare("INSERT INTO redeem (rollno, coins, itemName, status) VALUES (?, ?, ?, ?)")
+	_, err := stmt.Exec(rollno, coins, name, 1)
+	if err != nil {
+		fmt.Println(err)
+		return false
+	}
+	tx.Commit()
+
+	return true
+}
+
+func redeem(w http.ResponseWriter, r *http.Request) {
+	body, err := ioutil.ReadAll(r.Body)
+
+	if err != nil {
+		panic(err)
+	}
+
+	if !IsJSON(string(body)) {
+		fmt.Println("Invalid Json!")
+		return
+	}
+
+	var redeem RedeemReqCust
+	json.Unmarshal([]byte(string(body)), &redeem)
+
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	claims, status1 := ExtractClaims(r.Header["Token"][0])
+
+	if status1 {
+		if int(claims["rollno"].(float64)) != redeem.Rollno {
+			fmt.Println("Please login from your own account!")
+			return
+		}
+	} else {
+		fmt.Println("Please try again!")
+		return
+	}
+
+	permission := GetUserPermission(a.DB, redeem.Rollno)
+
+	if permission == 0 {
+		currentBalance := GetCoins(a.DB, redeem.Rollno)
+
+		if currentBalance < redeem.Coins {
+			fmt.Println("Insufficient Balance!")
+			return
+		} else {
+			status := AddRedeemRequest(a.DB, redeem.ItemName, redeem.Rollno, redeem.Coins)
+			if status {
+				fmt.Println("Request Initiated!")
+				return
+			} else {
+				fmt.Println("Error in creating request, please try again!")
+				return
+			}
+		}
+	} else {
+		fmt.Println("Admins' are not allowed to redeem coins!")
+		return
+	}
+}
+
+func GetReqData(db *sql.DB, id int) (string, string, string) {
+	query := db.QueryRow("select rollno, coins, itemName, status from redeem where id=$1", id)
+	var rollno string
+	var coins string
+	var status string
+	var itemName string
+
+	query.Scan(&rollno, &coins, &itemName, &status)
+
+	return rollno, coins, status
+}
+
+func UpdateRequestStatus(db *sql.DB, id int, status int) bool {
+	sid := strconv.Itoa(id)
+	sstatus := strconv.Itoa(status)
+	tx, _ := db.Begin()
+	stmt, _ := tx.Prepare("update redeem set status=? where id=?")
+	_, err := stmt.Exec(sstatus, sid)
+	if err != nil {
+		fmt.Println(err)
+		return false
+	}
+	tx.Commit()
+
+	return true
+}
+
+func approverequest(w http.ResponseWriter, r *http.Request) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	time.Sleep(1 * time.Second)
+
+	r.ParseForm()
+	w.Header().Set("Content-Type", "application/json")
+
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	if !IsJSON(string(body)) {
+
+		fmt.Println("Invalid JSon!")
+		return
+	}
+
+	var req AcceptReq
+	json.Unmarshal([]byte(string(body)), &req)
+
+	claims, status1 := ExtractClaims(r.Header["Token"][0])
+
+	if status1 {
+		permission := GetUserPermission(a.DB, int(claims["rollno"].(float64)))
+
+		if permission == 2 {
+			rollno, coins, status := GetReqData(a.DB, req.Id)
+
+			rollno1, err1 := strconv.Atoi(rollno)
+			coins1, err2 := strconv.Atoi(coins)
+			status1, err3 := strconv.Atoi(status)
+
+			if err1 == nil && err2 == nil && err3 == nil {
+				if status1 != 1 {
+
+					fmt.Println("Request already responded!")
+					return
+				}
+
+				coins := GetCoins(a.DB, rollno1)
+				if coins < coins1 {
+					status := UpdateRequestStatus(a.DB, req.Id, 2)
+
+					if status {
+
+						fmt.Println("Request rejected, because of insufficient balance!")
+						return
+					} else {
+
+						fmt.Println("Please try again!")
+						return
+					}
+				} else {
+					userId := GetUserId(a.DB, rollno1)
+					status := UpdateUser(a.DB, userId, rollno1, coins-coins1)
+					if status {
+						status = UpdateRequestStatus(a.DB, req.Id, 0)
+						if status {
+
+							fmt.Println("Request approved successfully!")
+							return
+						} else {
+							_ = UpdateUser(a.DB, userId, rollno1, coins+coins1)
+
+							fmt.Println("Please try again!")
+							return
+						}
+					} else {
+
+						fmt.Println("Please try again!")
+						return
+					}
+				}
+			}
+		} else {
+
+			fmt.Println("You are not authorized to give Coins!")
+			return
+		}
+	} else {
+
+		fmt.Println("Please re-login and try again!")
+		return
+	}
+}
+
 func main() {
 	database, _ := sql.Open("sqlite3", "./userdata.db")
 	a.DB = database
@@ -508,6 +748,8 @@ func main() {
 	a.transactiondb = db
 	statement1, _ := db.Prepare("CREATE TABLE IF NOT EXISTS transactionHistory (id INTEGER PRIMARY KEY, typeOfTransaction TEXT, transferToRollno INTEGER, senderRollNo INTEGER, coins INTEGER, timestamp TEXT)")
 	statement1.Exec()
+	statement2, _ := db.Prepare("CREATE TABLE IF NOT EXISTS redeem (id INTEGER PRIMARY KEY, rollno INTEGER, coins INTEGER, itemName TEXT, status INTEGER)")
+	statement2.Exec()
 
 	/*rows, _ := database.Query("SELECT id, rollno, name FROM user")
 	var id int
@@ -538,6 +780,10 @@ func main() {
 	http.Handle("/initialise", isAuthorized(getbal))
 	http.Handle("/transfer", isAuthorized(transfer))
 	http.Handle("/balance", isAuthorized(balance))
+
+	http.Handle("/redeem", isAuthorized(redeem))
+	http.Handle("/approveRequest", isAuthorized(approverequest))
+	http.Handle("/showUnapprovedRequest", isAuthorized(unapprovedrequest))
 
 	fmt.Printf("Starting server at port 8080\n")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
